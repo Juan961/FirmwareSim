@@ -15,9 +15,8 @@ left_motor = robot.getDevice('left wheel motor')
 right_motor = robot.getDevice('right wheel motor')
 compass = robot.getDevice('compass')
 gps = robot.getDevice('gps')
+camera = robot.getDevice('camera')
 lidar = robot.getDevice('LDS-01')
-lidar.enable(timestep)
-lidar.enablePointCloud()
 
 
 for m in [left_motor, right_motor]:
@@ -26,12 +25,12 @@ for m in [left_motor, right_motor]:
 
 compass.enable(timestep)
 gps.enable(timestep)
+camera.enable(timestep)
+lidar.enable(timestep)
+lidar.enablePointCloud()
 
 target_pos = { "x": 0, "y": 0 }
 telemetry_counter = 0
-
-# 0 NOTHING, 1 IS OCCUPIED
-grid = [ [0 for _ in range(240)] for _ in range(240) ]
 
 KP_STEER = 1
 ANGLE_THRESHOLD = 0.0349066 # 2 deg
