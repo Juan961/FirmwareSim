@@ -5,10 +5,6 @@ from .mqtt_client import get_client
 from config import MQTT_CONFIG
 
 
-def on_message(topic, payload, **kwargs):
-    print("Received message from topic '{}': {}".format(topic, payload))
-
-
 def mqtt_init_sub():
     print("===== Initializing MQTT subscriber... =====")
 
@@ -26,5 +22,5 @@ def mqtt_init_sub():
     suback = subscribe_future.result(100)
 
     print("Suback received with reason codes: {}".format(suback.reason_codes))
-    print("✓ Successfully subscribed to both topics")
+    print("✓ Successfully subscribed to topic")
     print("Listening for messages...\n")
