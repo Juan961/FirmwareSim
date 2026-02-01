@@ -1,15 +1,15 @@
 import time
-from math import atan2, sqrt
+import json
+from math import atan2
+from threading import Thread
 
 
 from controller import Robot
 
 
-from navigation.a_star import a_star
-from navigation.lidar import update_grid_status, world_to_grid, grid_to_world
-from remote import mqtt_init_sub, telemetry_worker, telemetry_queue
-
-from utils.angles import wrap_pi, rad_to_deg, deg_to_rad
+import handlers
+from handlers import mission_control
+from remote import mqtt_init_sub, telemetry_worker, commands_queue
 
 
 robot = Robot()
@@ -36,20 +36,10 @@ lidar.enable(timestep)
 lidar.enablePointCloud()
 
 
-global_target_pos = { "x": 0, "y": 0 }
-next_target_pos = { "x": 0, "y": 0 }
+mission_control.set_motors(left_motor, right_motor)
+
+
 telemetry_counter = 0
-
-
-KP_STEER = 1
-ANGLE_THRESHOLD = deg_to_rad(5)
-DISTANCE_THRESHOLD = 0.2
-
-
-grid = [[ 0 for _ in range(120) ] for _ in range(120)]
-
-
-STATUS = "IDLE"
 
 
 def save_grid_to_file(grid, filename="debug_grid.txt"):
@@ -72,75 +62,107 @@ def save_path_to_file(path, filename="debug_path.txt"):
         print(f"Error saving path: {e}")
 
 
+current_command = None
+current_command_status_file = "./remote/command_status.json"
+current_command_status = None
+
+
+threads = []
+
+
+# thread_telemetry = Thread(target=telemetry_worker, args=())
+# thread_telemetry.start()
+# threads.append(thread_telemetry)
+
+mqtt_init_sub()
+
+
 while robot.step(timestep) != -1:
-    # ==================== GENERAL SENSORS ====================
+    # ==================== GENERAL SENSORS READING ====================
     range_image = lidar.getRangeImage()
 
     direction = compass.getValues()
     heading = atan2(direction[1], direction[0])
-    deg_north = rad_to_deg(heading)
+    [lon, lat, _] = gps.getValues()
 
-    [x, y, _] = gps.getValues()
-    bearing = atan2(global_target_pos["y"] - y, global_target_pos["x"] - x)
-    deg_tar = rad_to_deg(bearing)
+    data = {
+        "lat": lat,
+        "lon": lon,
+        "heading": heading,
+        "lidar": range_image
+    }
 
-    global_error_angle = wrap_pi(bearing - heading)
-    global_error_angle_deg = rad_to_deg(global_error_angle)
+    mission_control.new_data(data)
 
-    target_dist = sqrt( (global_target_pos["y"] - y)**2 + (global_target_pos["x"] - x)**2)
+    # ==================== MAIN COMMAND QUEUE HANDLER ====================
+    if current_command is None and commands_queue.is_empty() == False:
+        current_command = commands_queue.get_next_command()
 
-    # ==================== NAVIGATION ====================
-    grid_current_position = world_to_grid(x, y)
-    grid_target_position = world_to_grid(global_target_pos["x"], global_target_pos["y"])
+    elif commands_queue.priorized_command_available(current_command):
+        commands_queue.add_command(current_command)
+        current_command = commands_queue.get_next_command()
 
-    grid = update_grid_status(grid, range_image, (x, y), deg_north)
+    with open(current_command_status_file, "r") as f:
+        data = json.load(f)
 
-    path = a_star(grid, grid_current_position, grid_target_position)
+        if data.get("status"):
+            current_command_status = data["status"]
 
-    if path and len(path) > 10:
-        next_waypoint_grid = path[10]
-        next_target_pos = grid_to_world(next_waypoint_grid[0], next_waypoint_grid[1])
-    else:
-        next_target_pos = (global_target_pos["x"], global_target_pos["y"])
+    if current_command_status == "COMPLETED":
+        print("===== Command completed =====")
+        if current_command is not None:
+            commands_queue.mark_command_completed(current_command["message_id"])
+        current_command = None
+        current_command_status = None
+        # Clear the status file
+        try:
+            with open(current_command_status_file, "w") as f:
+                json.dump({}, f)
+        except Exception as e:
+            print(f"Error clearing command status: {e}")
 
-    bearing = atan2(next_target_pos[0] - x, next_target_pos[1] - y)
-    deg_tar_local = rad_to_deg(bearing)
+    elif current_command_status == "FAILED":
+        print("===== Command failed =====")
+        if current_command is not None:
+            commands_queue.mark_command_failed(current_command["message_id"])
+        current_command = None
+        current_command_status = None
+        # Clear the status file
+        try:
+            with open(current_command_status_file, "w") as f:
+                json.dump({}, f)
+        except Exception as e:
+            print(f"Error clearing command status: {e}")
 
-    local_error_angle = wrap_pi(bearing - heading)
-    local_error_angle_deg = rad_to_deg(local_error_angle)
+    elif current_command_status == "QUEUED":
+        print("===== Starting command =====")
+        func = getattr(handlers, current_command["command"].lower())
+        thread = Thread(target=func, args=(current_command["message_id"], current_command["payload"],))
+        thread.start()
+        threads.append(thread)
 
-    local_dist = sqrt((next_target_pos[1] - y)**2 + (next_target_pos[0] - x)**2)
+        current_command_status = "IN_PROGRESS"
 
-    if target_dist < DISTANCE_THRESHOLD:
-        if target_dist < 0.2 and local_dist < 0.2:
-            STATUS = "AT TARGET"
-            left_motor.setVelocity(0)
-            right_motor.setVelocity(0)
-        else:
-            STATUS = "REACHED WAYPOINT"
-    elif abs(local_error_angle) > ANGLE_THRESHOLD:
-        base_speed = 1
-        steer = max(min(local_error_angle * KP_STEER, 1), -1)
-        left_motor.setVelocity(base_speed+steer)
-        right_motor.setVelocity(base_speed-steer)
-        STATUS = f"TURNING TO {'RIGHT' if steer > 0 else 'LEFT'}"
-    else:
-        STATUS = "MOVING FORWARD"
-        left_motor.setVelocity(2.0)
-        right_motor.setVelocity(2.0)
+        commands_queue.mark_command_in_progress(current_command["message_id"])
+
+    elif current_command_status == "IN_PROGRESS":
+        pass
 
     telemetry_counter += 1
 
     if telemetry_counter % 20 == 0:
+        pass
         # now = time.time()
         # image_path = f"/images/{now}.png"
         # camera.saveImage(image_path, 100)
 
-        save_grid_to_file(grid)
-        save_path_to_file(path if path else [], filename="debug_path.txt")
+        # save_grid_to_file(grid)
+        # save_path_to_file(path if path else [], filename="debug_path.txt")
 
-        print(f"Status: {STATUS}", end=' | ')
+        # print(f"Status: {STATUS}", end=' | ')
         # print(f"Heading: {deg_north:.2f} | Bearing: {deg_tar:.2f} | Error: {error_angle_deg:.2f} | Pos X: {pos[0]:.2f} | Pos Y: {pos[1]:.2f}")
         # print(f"FORWARD: {range_image[180]:.2f} | BACKWARD: {range_image[0]:.2f} | RIGHT: {range_image[180]:.2f} | LEFT: {range_image[270]:.2f} | Pos X: {pos[0]:.2f} | Pos Y: {pos[1]:.2f}")
-        print(f"Pos: ({x:.2f}, {y:.2f}) | Local target: ({next_target_pos[0]:.2f}, {next_target_pos[1]:.2f}) | Heading {deg_north:.2f} | Global target angle: {deg_tar:.2f} | Local target angle: {deg_tar_local:.2f}")
+        # print(f"Pos: ({x:.2f}, {y:.2f}) | Local target: ({next_target_pos[0]:.2f}, {next_target_pos[1]:.2f}) | Heading {deg_north:.2f} | Global target angle: {deg_tar:.2f} | Local target angle: {deg_tar_local:.2f}")
         # print(f"Heading: {deg_north:.2f} | Pos: ({x:.2f}, {y:.2f}) | Target: ({next_target_pos[0]:.2f}, {next_target_pos[1]:.2f}) | Distance: {dist:.2f}m")
+
+    time.sleep(0.1)
